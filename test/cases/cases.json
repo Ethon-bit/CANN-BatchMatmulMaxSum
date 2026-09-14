@@ -1,0 +1,129 @@
+{
+  "_说明": [
+    "测试用例定义。每个用例描述一种形状 + 存储布局 + 数据类型的组合。",
+    "覆盖重点来自赛题 3.4 节的约束和 3.7 节的特殊值规则。",
+    "transposeX1 / transposeX2 四种组合必须全部覆盖（赛题硬性要求）。"
+  ],
+
+  "cases": [
+    {
+      "name": "示例1_基础计算",
+      "desc": "赛题示例1：最小规模，M/N/K 都对齐",
+      "B": 1, "M": 2, "N": 3, "K": 32,
+      "transposeX1": false, "transposeX2": false,
+      "dtype": "float16",
+      "expect_y": [2.0],
+      "fixed_input": {
+        "note": "赛题示例1原文值：x1=[[[1,0],[0,1]]]，x2=[[[1,0,-1],[0,1,0]]]。K=2 在末尾补 30 列 0 到 K=32，补零不影响结果",
+        "x1_logical": [[[1.0, 0.0], [0.0, 1.0]]],
+        "x2_logical": [[[1.0, 0.0, -1.0], [0.0, 1.0, 0.0]]]
+      }
+    },
+    {
+      "name": "示例3_全负相似度",
+      "desc": "赛题示例3：检验 MaxSim 初值不能为 0。这是最经典的坑",
+      "B": 1, "M": 1, "N": 2, "K": 32,
+      "transposeX1": false, "transposeX2": false,
+      "dtype": "float16",
+      "expect_y": [-1.0],
+      "special": "全负",
+      "fixed_input": {
+        "note": "x2 用负值构造，使全部相似度为负",
+        "x1_logical": [[[1.0, 0.0]]],
+        "x2_logical": [[[-1.0, -2.0], [0.0, 0.0]]]
+      }
+    },
+    {
+      "name": "最小规模",
+      "desc": "B=1, M=1, N=1, K=32 的边界最小值",
+      "B": 1, "M": 1, "N": 1, "K": 32,
+      "transposeX1": false, "transposeX2": false,
+      "dtype": "float16"
+    },
+    {
+      "name": "最大Batch",
+      "desc": "B=64 上限，检验多核切分是否均衡",
+      "B": 64, "M": 32, "N": 32, "K": 64,
+      "transposeX1": false, "transposeX2": false,
+      "dtype": "float16"
+    },
+    {
+      "name": "小Batch大M_需沿M切分",
+      "desc": "B=1 但 M 很大，核用不满时必须沿 M 维切分，考察负载均衡",
+      "B": 1, "M": 4096, "N": 64, "K": 128,
+      "transposeX1": false, "transposeX2": false,
+      "dtype": "float16"
+    },
+    {
+      "name": "非对齐尾块_M17_N33",
+      "desc": "M=17, N=33 都不是 16 的倍数，考察尾块补零不污染结果",
+      "B": 2, "M": 17, "N": 33, "K": 64,
+      "transposeX1": false, "transposeX2": false,
+      "dtype": "float16"
+    },
+    {
+      "name": "非对齐尾块_K40",
+      "desc": "K=40 是 8 的倍数但不是 16 的倍数，考察 K 方向尾块",
+      "B": 3, "M": 20, "N": 20, "K": 40,
+      "transposeX1": false, "transposeX2": false,
+      "dtype": "float16"
+    },
+    {
+      "name": "布局_仅转置X1",
+      "desc": "transposeX1=true, transposeX2=false，四种布局之一",
+      "B": 4, "M": 33, "N": 17, "K": 64,
+      "transposeX1": true, "transposeX2": false,
+      "dtype": "float16"
+    },
+    {
+      "name": "布局_仅转置X2",
+      "desc": "transposeX1=false, transposeX2=true，四种布局之一",
+      "B": 4, "M": 33, "N": 17, "K": 64,
+      "transposeX1": false, "transposeX2": true,
+      "dtype": "float16"
+    },
+    {
+      "name": "布局_双重转置",
+      "desc": "transposeX1=true, transposeX2=true，对应赛题示例2的场景",
+      "B": 4, "M": 33, "N": 17, "K": 64,
+      "transposeX1": true, "transposeX2": true,
+      "dtype": "float16"
+    },
+    {
+      "name": "大N",
+      "desc": "N=8192 上限，考察沿 N 维分块是否正确",
+      "B": 2, "M": 64, "N": 8192, "K": 64,
+      "transposeX1": false, "transposeX2": false,
+      "dtype": "float16"
+    },
+    {
+      "name": "大K",
+      "desc": "K=8192 上限，考察 FP32 累加精度是否达标",
+      "B": 1, "M": 32, "N": 32, "K": 8192,
+      "transposeX1": false, "transposeX2": false,
+      "dtype": "float16"
+    },
+    {
+      "name": "bfloat16_基础",
+      "desc": "验证 BFLOAT16 分支（精度要求放宽到 1e-3）",
+      "B": 8, "M": 16, "N": 16, "K": 64,
+      "transposeX1": false, "transposeX2": false,
+      "dtype": "bfloat16"
+    },
+    {
+      "name": "bfloat16_转置布局",
+      "desc": "BFLOAT16 + 双重转置组合",
+      "B": 8, "M": 33, "N": 17, "K": 64,
+      "transposeX1": true, "transposeX2": true,
+      "dtype": "bfloat16"
+    }
+  ],
+
+  "_精度要求": {
+    "_来源": "赛题第五节 精度判断规则",
+    "float32":  { "rtol": 1e-4, "atol": 1e-4 },
+    "float16":  { "rtol": 1e-3, "atol": 1e-3 },
+    "bfloat16": { "rtol": 1e-3, "atol": 1e-3 },
+    "int32":    { "exact": true }
+  }
+}

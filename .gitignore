@@ -1,0 +1,47 @@
+# ==================== 构建产物 ====================
+build/
+out/
+*.o
+*.so
+*.a
+*.bin
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# ==================== 生成的测试数据 ====================
+# golden 和 NPU 输出都是**可重新生成**的（cases.json + 固定随机种子），
+# 而且大形状用例能到几十 MB，不适合进版本库。
+# 重新生成： python test/test_accuracy.py --gen
+test/cases/golden/
+test/cases/npu_out/
+*.npy
+*.npy.gz
+
+# ==================== 算子编译产物 ====================
+# CANN 算子编译会生成一堆自动代码，不需要手动管理
+op_kernel/*_kernel_*.cpp
+kernel_meta/
+*.json.bak
+*.ini.bak
+
+# ==================== Python ====================
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# ==================== 编辑器 / 系统 ====================
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ==================== 比赛相关（不公开） ====================
+# 如果比赛要求保密，把临时笔记和草稿放在这里，不要提交
+notes/private/
+*.local.md
