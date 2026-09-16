@@ -5,6 +5,7 @@ out/
 *.so
 *.a
 *.bin
+*.exe
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
@@ -17,6 +18,8 @@ compile_commands.json
 # 重新生成： python test/test_accuracy.py --gen
 test/cases/golden/
 test/cases/npu_out/
+# cpp_bridge.py 跑出来的中间文件（input.txt 可达 40MB+）
+test/cases/cpp_work/
 *.npy
 *.npy.gz
 
