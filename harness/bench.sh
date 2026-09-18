@@ -46,7 +46,27 @@ if [ -z "${ASCEND_HOME_PATH:-}" ]; then
 fi
 
 # ---------- 编译 ----------
+#
+# ⚠️ 这里必须检测「源文件比二进制新」，不能只看 build/ 在不在。
+#
+# 踩过的坑：bench_variants.sh 会连续换 kernel.asc 编译多个变体。它跑完后
+# build/ 里留下的是**最后一个变体**的二进制。之后如果只换 kernel.asc 而不
+# 重新编译，跑的就还是上一个变体 —— 现象是「所有用例都输出 0」，
+# 极容易被误读成「kernel 在大形状上静默失败」。
+#
+# 教训：只要 build/ 存在就跳过编译 = 悄悄跑错二进制。必须比时间戳。
+NEED_BUILD=0
 if [ ! -x "build/${OP}" ] || [ ! -f build/Makefile ]; then
+    NEED_BUILD=1
+fi
+for f in kernel.asc main.asc CMakeLists.txt data_utils.h; do
+    if [ -f "$f" ] && [ "$f" -nt "build/${OP}" ]; then
+        NEED_BUILD=1
+        echo "（检测到 ${f} 比编译产物新 ⇒ 需要重新编译）"
+    fi
+done
+
+if [ "${NEED_BUILD}" = "1" ]; then
     echo "=== 编译 ==="
     rm -rf build && mkdir -p build
     (
@@ -86,6 +106,10 @@ PY
 echo "============================================================"
 echo "  case${CID}   B=${B} M=${M} N=${N} K=${K}  dtype=${DT}  tx=(${TX1},${TX2})"
 echo "  shape_mode=${MODE}（1=存储形状，平台实际约定）   重复 ${REP} 次"
+# ★ 打印当前用的是哪个 kernel —— 防止"换了文件却跑着旧二进制"这类错误再发生
+if [ -f kernel.asc ]; then
+    echo "  kernel.asc : $(wc -c < kernel.asc) 字节   md5=$(md5sum kernel.asc 2>/dev/null | cut -c1-8)"
+fi
 echo "============================================================"
 
 echo "${B} ${M} ${N} ${K} ${DT} ${TX1} ${TX2} ${MODE}" > case.txt
