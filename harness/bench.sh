@@ -130,7 +130,7 @@ if [ $rc -ne 0 ]; then
 fi
 
 # ---------- 打印 [shape] / [phase] ----------
-grep -E '^\[shape\]|^\[phase\]' /tmp/bench.log | head -20
+grep -E '^\[mpar\]|^\[shape\]|^\[phase\]' /tmp/bench.log | head -20
 
 # ---------- 打印 [bench] ----------
 echo

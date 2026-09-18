@@ -1,49 +1,56 @@
 """
 从 op_kernel/kernel_cachefix.asc 派生出 op_kernel/kernel_mpar.asc
-—— 「沿 M 维切分多核」版本。
+—— 「安全混合版」：能用 M 并行时用，不能用时原样退回。
 
 ======================================================================
-为什么要做这件事
+为什么要做成混合版
 ======================================================================
 
-本地实测（CANN 9.1.0 + Ascend910，md5=7881ae81 那版 kernel）：
+本地实测发现一条**完美分隔**的规律（M 并行版，20 核机器）：
 
-    用例     形状                    M块数  核数   kernel段
-    case01  B=1    2x3x32              1     1     34.1us
-    case13  B=1   65x16x32             2     1     43.1us
-    case14  B=1  255x33x32             4     1     60.5us
-    case21  B=1  512x512x32            8     1    111.4us
-    case17  B=1 1024x1024x1024        16     1    552.6us
+    用例     单元数  核数   单元/核   结果
+    case09     8      8      1.0     ✅  83us
+    case10     8      8      1.0     ✅  86us
+    case13     2      2      1.0     ✅  83us
+    case14     4      4      1.0     ✅  87us
+    case17    16     16      1.0     ✅ 146us
+    case21     8      8      1.0     ✅  98us
+    case23     8      8      1.0     ✅  87us
+    ---------------------------------------------------------------
+    case18    64     20      3.2     ❌  80ms，7/8 错
+    case19   256     20     12.8     ❌  94ms，16/16 错
 
-两个结论：
+**单元/核 == 1 的全部正常，> 1 的全部出事，没有例外。**
 
-1) **B=1 时只用 1 个核**（"核数"那列全是 1）。机器有 20 个核，19 个在闲着。
-   赛题 3.4 允许 B 到 64，但也明确要求"沿 B 维和/或 M 维合理分配多核任务，
-   兼顾**较小 Batch**"—— 现在这版没做 M 维切分。
-
-2) **每个 M 块有 5~32us 的固定开销**：
-   case21 的 8 块共 77us（每块 9.7us），而一个 64x512x32 的矩阵乘 Cube 只要
-   0.14us —— 每块 98% 的时间花在 SetOrgShape/SetTensorA/SetTensorB/SetTail/
-   IterateAll 这一串调用上。
+「每核多个单元」那条路径的责任还没查清（见 kernel_mpar 的调试记录）。
+在查清之前，正确的工程做法是：**只用已验证的那条路径**。
 
 ======================================================================
-改法
+本版本的行为
 ======================================================================
 
-把任务单位从「一个核 = 一个 batch」改成「一个核 = 一批 (batch, M块) 单元」：
+    host 侧判断：  useMpar = (B * numMBlocks < availableCoreNum)
+                   （严格小于，刻意留一个核的余量）
 
-    for (unit = coreIdx; unit < B*numMBlocks; unit += coreNum)
-        b  = unit / numMBlocks
-        mb = unit % numMBlocks
+    useMpar 为真  →  blockNum = B*numMBlocks，每个核恰好分到 1 个单元
+                     ⇒ 走 M 并行路径（本地七个用例全部验证过）
+    useMpar 为假  →  blockNum = min(B, availableCoreNum)
+                     ⇒ 走**原版路径**，代码与原 kernel_cachefix 逐字相同
 
-每个核把自己负责的块算出的 partial 累加进**本核的** partLocal[b]（UB 里，带
-Kahan 补偿），然后写进 GM 上的部分和区，SyncAll() 之后按**固定顺序**归约。
+分支判据由 host 算好写进 tiling（BmmsTiling.useMpar），所有核读到同一个值，
+因此不存在「有的核进 if、有的核进 else」导致 SyncAll 缺席死锁的问题。
 
-数值影响：
-    沿 M 切分后，求和的结合顺序变了。浮点加法不满足结合律，所以结果会有
-    极微小差异 —— 量级在 1e-7 相对误差，远小于赛题要求的 1e-4。
-    归约顺序固定（c = 0..coreNum-1 顺序相加），所以**多次执行结果完全一致**，
-    满足赛题"数值一致性规则"。
+======================================================================
+收益预期
+======================================================================
+
+    用例     形状                单元数   走哪条路      提速
+    case17  B=1 1024x1024x1024    16    M 并行       4.15x（已实测）
+    case21  B=1 512x512x32         8    M 并行       1.63x（已实测）
+    case14  B=1 255x33x32          4    M 并行       1.30x（已实测）
+    其余（B 大、或 M 块数 >= 核数）      原版路径      1.00x（无变化，但无风险）
+
+也就是说：**只在有把握的地方提速，没把握的地方保持原样。**
 
 ======================================================================
 用法
@@ -59,6 +66,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 SRC = os.path.join(ROOT, "op_kernel", "kernel_cachefix.asc")
 DST = os.path.join(ROOT, "op_kernel", "kernel_mpar.asc")
+
+# 原版循环里「一个 M 块的计算主体」的起止锚点（用来原样搬进 M 并行路径）
+INNER_BEGIN = "            const int32_t tmCnt = static_cast<int32_t>("
+INNER_END = "            // 把本 m 块的 partial 也以补偿方式累进 total"
+
+LOOP_HEADER = "    for (int64_t b = GetBlockIdx(); b < B; b += coreNum) {"
+LOOP_TAIL = "    }       // end for b"
 
 
 def main():
@@ -78,47 +92,52 @@ def main():
         print(f"  [ok] {tag}")
 
     # ================================================================
-    # 1) 常量：B 的上限
+    # 0) 先把「M 块计算主体」原样抠出来 —— M 并行路径要复用它
+    #    （从 tmCnt 开始，到 Kahan 累进 total 之前为止）
     # ================================================================
-    rep("常量 kMaxBatch",
+    i0 = text.index(INNER_BEGIN)
+    i1 = text.index(INNER_END)
+    INNER = text[i0:i1]
+    print(f"  [ok] 抠出计算主体 {INNER.count(chr(10))} 行")
+    assert "DataCopyPad(cLocal" in INNER and "WholeReduceMax" in INNER
+
+    # ================================================================
+    # 1) 常量
+    # ================================================================
+    rep("常量 kMaxBatch / kPartStride",
         "constexpr int32_t kDtFp16 = 1;",
-        "// 赛题 3.4：1 <= B <= 64。部分和累加器按 batch 下标索引。\n"
-        "// 取 128 而不是 64，是为了万一某个测试点超出题面约束也不至于越界写 UB。\n"
-        "// 代价只有 512 字节 UB（我们总共才用到 ~66KB，UB 有 192KB）。\n"
+        "// 赛题 3.4：1 <= B <= 64。部分和累加器按 batch 下标索引，取 128 留余量。\n"
         "constexpr int32_t kMaxBatch = 128;\n"
         "\n"
         "// ★★ 每个核在 GM 部分和区里独占的 float 个数（128 * 4B = 512B）。\n"
-        "//\n"
-        "//   为什么必须独占一整段、而不是按 [b*核数 + 核号] 紧密排列：\n"
-        "//   紧密排列时 B 只有 8 个 float = 32 字节，一条 cache line 里塞着\n"
-        "//   十几个不同核的数据。多核并发写同一条 cache line 会互相冲掉\n"
-        "//   （false sharing），实测症状：\n"
-        "//     - 8 个输出里偶发 1 个变成 0（写丢了）\n"
-        "//     - 核数越多越严重：B=8/16 且铺满 20 个核时耗时从 ~1ms 暴涨到 100ms\n"
-        "//   拉开成每核 512B（≥ 4 条典型 128B cache line）之后就没有共享了。\n"
+        "//   紧密排列（partGm[b*核数 + 核号]）时 B 只有 8 个 float = 32 字节，\n"
+        "//   一条 cache line 里塞着十几个核的数据，多核并发写会互相冲掉\n"
+        "//   （false sharing）。拉开成每核 512B 就没有共享了 —— 实测这条修完，\n"
+        "//   case10 从「1/8 错」变成通过。\n"
         "constexpr int32_t kPartStride = 128;\n"
         "\n"
         "constexpr int32_t kDtFp16 = 1;")
 
     # ================================================================
-    # 2) BmmsTiling：加 partOffset
+    # 2) BmmsTiling：加 useMpar
     # ================================================================
-    rep("BmmsTiling 加 partOffset",
+    rep("BmmsTiling 加 useMpar / partOffset",
         "    int32_t dtypeCode;\n};",
         "    int32_t dtypeCode;\n"
-        "    // ★ M 并行版：部分和区相对 cScratchGm 的起始**元素**下标。\n"
-        "    //   布局是 [每核 C 暂存区 cScratchElems 个] x blockNum，紧跟着\n"
-        "    //   B*blockNum 个 float 的部分和（按 [b*blockNum + coreIdx] 索引）。\n"
+        "    // ★ 是否走 M 并行路径。由 host 算好，所有核读到同一个值，\n"
+        "    //   保证不会出现「部分核进 if、部分核进 else」而导致 SyncAll 缺席。\n"
+        "    int32_t useMpar;\n"
+        "    // 部分和区相对 cScratchGm 的元素下标（布局 [核号*kPartStride + b]）。\n"
         "    int64_t partOffset;\n};")
 
     # ================================================================
-    # 3) UB：部分和累加器（值 + Kahan 补偿）
+    # 3) UB：部分和累加器
     # ================================================================
     rep("TBuf 声明",
         "    TBuf<TPosition::VECCALC> yBuf;",
         "    TBuf<TPosition::VECCALC> yBuf;\n"
-        "    TBuf<TPosition::VECCALC> partBuf;    // ★ M 并行版：每核的部分和累加器\n"
-        "    TBuf<TPosition::VECCALC> partCBuf;   // ★ Kahan 补偿项")
+        "    TBuf<TPosition::VECCALC> partBuf;    // M 并行路径：每核的部分和累加器\n"
+        "    TBuf<TPosition::VECCALC> partCBuf;   // 对应的 Kahan 补偿项")
 
     rep("InitBuffer",
         "    pipe.InitBuffer(yBuf, 8 * sizeof(float));                // 32B，够放一个 fp32",
@@ -133,72 +152,61 @@ def main():
         "    LocalTensor<float> partCLocal = partCBuf.Get<float>();")
 
     # ================================================================
-    # 4) yGm 之后：加 partGm
+    # 4) yGm 之后：绑定 partGm、算 totalUnits
     # ================================================================
-    rep("partGm 绑定",
+    rep("绑定 partGm",
         "    GlobalTensor<float> yGm;\n"
         "    yGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(y), static_cast<uint32_t>(B));",
         "    GlobalTensor<float> yGm;\n"
         "    yGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(y), static_cast<uint32_t>(B));\n"
         "\n"
-        "    // ★ M 并行版：跨核部分和区。\n"
-        "    //   布局 [核号 * kPartStride + b] —— 每个核独占 kPartStride 个 float，\n"
-        "    //   彼此不共享 cache line（详见 kPartStride 处的说明）。\n"
-        "    //   放在 C 暂存区之后（host 侧算好偏移填进 tiling.partOffset）。\n"
-        "    const int64_t coreNum = GetBlockNum();\n"
+        "    // M 并行路径要用的跨核部分和区（原版路径用不到，绑好放着不花钱）。\n"
         "    const int64_t coreIdx = GetBlockIdx();\n"
         "    GlobalTensor<float> partGm;\n"
         "    partGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(cScratchGm) + t->partOffset,\n"
         "                           static_cast<uint32_t>(coreNum * kPartStride));")
 
     # ================================================================
-    # 5) 循环头：batch 循环 -> 单元循环
+    # 5) coreNum 原来定义在 batch 循环前面，现在提前到上面那段用得到，
+    #    这里把重复的定义删掉
     # ================================================================
-    rep("循环头改成 unit 循环",
-        "    for (int64_t b = GetBlockIdx(); b < B; b += coreNum) {\n"
-        "        float total = 0.0f;      // 顺序固定 ⇒ 确定性（题面规则 1）\n"
-        "        float totalC = 0.0f;     // ★ 第 35 轮：Kahan 补偿项，见下方 M 求和处\n"
-        "        for (int64_t mb = 0; mb < numMBlocks; ++mb) {\n"
-        "            const int64_t tm0 = mb * baseM;\n"
-        "            if (tm0 >= M) {\n"
-        "                break;\n"
-        "            }",
-        "    // ★★ M 并行版：任务单位 = (batch, M块)。\n"
-        "    //\n"
-        "    //   原版是 `for (b = blockIdx; b < B; b += coreNum)` —— 一个核包干\n"
-        "    //   一个完整 batch。B=1 时只有 1 个核在干活。\n"
-        "    //   现在按 unit = b*numMBlocks + mb 做跨核轮转，B=1 时也能铺满所有核。\n"
-        "    //\n"
-        "    //   每个核维护自己的 partLocal[b]（UB 里，带 Kahan 补偿），\n"
-        "    //   最后写进 GM 的部分和区，SyncAll 之后按固定顺序归约。\n"
-        "    const int64_t totalUnits = B * numMBlocks;\n"
-        "\n"
-        "    Duplicate(partLocal,  0.0f, kMaxBatch);\n"
-        "    Duplicate(partCLocal, 0.0f, kMaxBatch);\n"
-        "\n"
-        "    for (int64_t unit = coreIdx; unit < totalUnits; unit += coreNum) {\n"
-        "        const int64_t b  = unit / numMBlocks;\n"
-        "        const int64_t mb = unit - b * numMBlocks;\n"
-        "        const int64_t tm0 = mb * baseM;\n"
-        "        if (tm0 >= M) {\n"
-        "            continue;      // 注意是 continue 不是 break：单元是跨步取的不是连续的\n"
-        "        }")
+    rep("删掉重复的 coreNum 定义",
+        "    //   3. 核内按 m 块固定顺序累加 => 多次执行结果完全一致（题面规则 1）\n"
+        "    const int64_t coreNum = GetBlockNum();\n",
+        "    //   3. 核内按 m 块固定顺序累加 => 多次执行结果完全一致（题面规则 1）\n"
+        "    //   （coreNum 已在上面绑定 partGm 时定义）\n")
+
+    # coreNum 现在还没定义 —— 补在 coreIdx 前面
+    rep("补上 coreNum 定义",
+        "    const int64_t coreIdx = GetBlockIdx();\n"
+        "    GlobalTensor<float> partGm;",
+        "    const int64_t coreNum = GetBlockNum();\n"
+        "    const int64_t coreIdx = GetBlockIdx();\n"
+        "    GlobalTensor<float> partGm;")
 
     # ================================================================
-    # 6) 循环尾：累进 total -> 累进 partLocal[b]
+    # 6) 把 if (useMpar) { ...M并行... } else { 原版循环 } 拼出来
     # ================================================================
-    rep("循环尾改成累进 partLocal",
-        "            // 把本 m 块的 partial 也以补偿方式累进 total（跨 m 块同样是长链求和）\n"
-        "            {\n"
-        "                const float yt = partial - totalC;\n"
-        "                const float tt = total + yt;\n"
-        "                totalC = (tt - total) - yt;\n"
-        "                total = tt;\n"
+    MPAR = (
+        "    if (t->useMpar != 0) {\n"
+        "        // ============ M 并行路径 ============\n"
+        "        // 前提：host 已经保证 B*numMBlocks < availableCoreNum，\n"
+        "        // 也就是**每个核恰好分到 1 个单元** —— 这条路径本地七个用例全过。\n"
+        "        const int64_t totalUnits = B * numMBlocks;\n"
+        "\n"
+        "        Duplicate(partLocal,  0.0f, kMaxBatch);\n"
+        "        Duplicate(partCLocal, 0.0f, kMaxBatch);\n"
+        "\n"
+        "        for (int64_t unit = coreIdx; unit < totalUnits; unit += coreNum) {\n"
+        "            const int64_t b  = unit / numMBlocks;\n"
+        "            const int64_t mb = unit - b * numMBlocks;\n"
+        "            const int64_t tm0 = mb * baseM;\n"
+        "            if (tm0 >= M) {\n"
+        "                continue;   // 单元是跨步取的，不能 break\n"
         "            }\n"
-        "        }   // end for mb\n",
-        "            // 把本块的 partial 以补偿方式累进 **本核** 的 partLocal[b]。\n"
-        "            // 每个核最多处理 ceil(B*numMBlocks/coreNum) 个块，项数少，\n"
-        "            // 但既然原版用了 Kahan，这里也保留，避免精度回退。\n"
+        "\n"
+        + INNER +
+        "            // 把本块的 partial 以补偿方式累进本核的 partLocal[b]\n"
         "            {\n"
         "                const int32_t bi = static_cast<int32_t>(b);\n"
         "                const float acc  = partLocal.GetValue(bi);\n"
@@ -208,108 +216,66 @@ def main():
         "                partCLocal.SetValue(bi, (tt - acc) - yt);\n"
         "                partLocal.SetValue(bi, tt);\n"
         "            }\n"
-        "    }   // end for unit\n")
-
-    # ================================================================
-    # 7) 尾部：写部分和 + SyncAll + 归约 + 写 y
-    # ================================================================
-    rep("尾部加 SyncAll 归约",
-        "        // ★★ 第 44 轮：y 的写出走 DMA（向量单元产出 → DataCopyPad 写回），\n"
-        "        //   并在 kernel 结束前**显式回写 cache**（见函数末尾的 DataCacheCleanAndInvalid）。\n"
-        "        //\n"
-        "        //   本地实测（dev/sweep.py，B=8 M=16 N=65 K=32，修复前）：\n"
-        "        //     - kernel 内读回 yGm[b] **8/8 全部正确**\n"
-        "        //     - 但 host 拷回来的 y 里有一半是 0（即 aclrtMalloc 的零初始化值）\n"
-        "        //     - 驱动侧 aclrtMemcpy / 同步 / 大小逐行核对，没有问题\n"
-        "        //   ⇒ **值停在 aicore 的 cache 里，从未回写到 GM**；kernel 内的读回命中的\n"
-        "        //     是同一个 cache，所以\"看起来写成功了\"。这正是判题里「部分测试点\n"
-        "        //     恰好错 1 个元素」的根因（判题跑的就是这份 kernel）。\n"
-        "        //   ⇒ 修法 = 本处 DMA 写出 + 函数末尾的 DataCacheCleanAndInvalid。\n"
-        "        //   修复后：本地 240 组合扫描全过，11 个本地用例全过，误差回到 1e-6 量级。\n"
-        "        Duplicate(yLocal, total, 1);\n"
-        "        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(evtV2E3);\n"
-        "        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(evtV2E3);\n"
-        "        DataCopyExtParams ycp{1, static_cast<uint32_t>(sizeof(float)), 0, 0, 0};\n"
-        "        DataCopyPad(yGm[static_cast<uint32_t>(b)], yLocal, ycp);\n"
-        "    }       // end for b\n",
-        "    // ---- 各核把自己的部分和写到 GM 上**自己那一段** ----\n"
-        "    //\n"
-        "    //   两个要点：\n"
-        "    //   1) 写到自己独占的 kPartStride 区间，避免多核写同一条 cache line\n"
-        "    //   2) 用 DMA（DataCopyPad）而不是标量 SetValue —— 标量写 GM 不走\n"
-        "    //      向量单元的写通路，正是本算子踩过的那个「写了不落盘」的坑\n"
-        "    {\n"
-        "        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(evtV2E3);\n"
-        "        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(evtV2E3);\n"
-        "        DataCopyExtParams pcp{1, static_cast<uint32_t>(B * sizeof(float)), 0, 0, 0};\n"
-        "        DataCopyPad(partGm[static_cast<uint32_t>(coreIdx * kPartStride)], partLocal, pcp);\n"
-        "    }\n"
-        "    // 让 GM 上的部分和对所有核可见。\n"
-        "    AscendC::DataCacheCleanAndInvalid<float, AscendC::CacheLine::ENTIRE_DATA_CACHE>(partGm);\n"
+        "        }   // end for unit\n"
         "\n"
-        "    // ★ 跨核同步：所有核都写完部分和之后，才允许开始归约。\n"
-        "    //   SyncAll 只保证「都执行到这儿了」，不保证 cache 可见性 —— 这正是本算子\n"
-        "    //   踩过的坑（y 写 GM 不回写 cache）。所以：\n"
-        "    //     写方：SyncAll **之前** clean，把脏数据推回 GM\n"
-        "    //     读方：SyncAll **之后** invalidate，丢掉本地可能过期的行，强制从 GM 读\n"
-        "    //   DataCacheCleanAndInvalid 同时做 clean + invalidate，两边都调是安全的。\n"
-        "    AscendC::SyncAll();\n"
-        "    AscendC::DataCacheCleanAndInvalid<float, AscendC::CacheLine::ENTIRE_DATA_CACHE>(partGm);\n"
-        "\n"
-        "    // ---- 归约：按 **固定顺序** c = 0..coreNum-1 相加 ⇒ 结果确定 ----\n"
-        "    //   注意这里也是按 b 轮转分核，每个 b 只由一个核写 y，不存在写冲突。\n"
-        "    for (int64_t b = coreIdx; b < B; b += coreNum) {\n"
-        "        float s = 0.0f;\n"
-        "        for (int64_t c = 0; c < coreNum; ++c) {\n"
-        "            s += partGm.GetValue(static_cast<uint32_t>(c * kPartStride + b));\n"
+        "        // ---- 各核把部分和写到自己独占的那一段（DMA，不是标量写）----\n"
+        "        {\n"
+        "            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(evtV2E3);\n"
+        "            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(evtV2E3);\n"
+        "            DataCopyExtParams pcp{1, static_cast<uint32_t>(B * sizeof(float)), 0, 0, 0};\n"
+        "            DataCopyPad(partGm[static_cast<uint32_t>(coreIdx * kPartStride)],\n"
+        "                        partLocal, pcp);\n"
         "        }\n"
-        "        // y 的写出走 DMA（向量单元产出 → DataCopyPad 写回），\n"
-        "        // 并在 kernel 结束前由 DataCacheCleanAndInvalid 强制回写 cache。\n"
-        "        Duplicate(yLocal, s, 1);\n"
-        "        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(evtV2E3);\n"
-        "        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(evtV2E3);\n"
-        "        DataCopyExtParams ycp{1, static_cast<uint32_t>(sizeof(float)), 0, 0, 0};\n"
-        "        DataCopyPad(yGm[static_cast<uint32_t>(b)], yLocal, ycp);\n"
-        "    }       // end for b（归约阶段）\n")
+        "        // 写方在 SyncAll 之前 clean，把脏数据推回 GM\n"
+        "        AscendC::DataCacheCleanAndInvalid<float, AscendC::CacheLine::ENTIRE_DATA_CACHE>(partGm);\n"
+        "\n"
+        "        // 跨核同步：所有核都写完部分和之后才开始归约\n"
+        "        AscendC::SyncAll();\n"
+        "        // 读方在 SyncAll 之后 invalidate，丢掉本地可能过期的行\n"
+        "        AscendC::DataCacheCleanAndInvalid<float, AscendC::CacheLine::ENTIRE_DATA_CACHE>(partGm);\n"
+        "\n"
+        "        // ---- 归约：按固定顺序 c = 0..coreNum-1 相加 ⇒ 结果确定 ----\n"
+        "        for (int64_t b = coreIdx; b < B; b += coreNum) {\n"
+        "            float s = 0.0f;\n"
+        "            for (int64_t c = 0; c < coreNum; ++c) {\n"
+        "                s += partGm.GetValue(static_cast<uint32_t>(c * kPartStride + b));\n"
+        "            }\n"
+        "            Duplicate(yLocal, s, 1);\n"
+        "            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(evtV2E3);\n"
+        "            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(evtV2E3);\n"
+        "            DataCopyExtParams ycp{1, static_cast<uint32_t>(sizeof(float)), 0, 0, 0};\n"
+        "            DataCopyPad(yGm[static_cast<uint32_t>(b)], yLocal, ycp);\n"
+        "        }   // end for b（归约阶段）\n"
+        "    } else {\n"
+        "    // ============ 原版路径（与 kernel_cachefix.asc 逐字相同）============\n"
+    )
+
+    rep("包成 if/else 两条路径", LOOP_HEADER, MPAR + LOOP_HEADER)
+
+    # 原版循环结束后补一个右括号关掉 else
+    rep("补上 else 的右括号",
+        LOOP_TAIL + "\n",
+        LOOP_TAIL + "\n"
+        "    }   // end if (t->useMpar != 0)\n")
 
     # ================================================================
-    # 8) 【已废弃】循环里原来那句 const int64_t coreNum = GetBlockNum(); 要删掉
-    #    （新的 coreNum 在上面的 partGm 绑定处已经定义了）
+    # 7) host：算 useMpar、定 blockNum、算 cScratch 大小
     # ================================================================
-    rep("删掉重复的 coreNum 定义",
-        "    //   3. 核内按 m 块固定顺序累加 => 多次执行结果完全一致（题面规则 1）\n"
-        "    const int64_t coreNum = GetBlockNum();\n",
-        "    //   3. 核内按 m 块固定顺序累加 => 多次执行结果完全一致（题面规则 1）\n"
-        "    //   （M 并行版：coreNum / coreIdx 已在上面绑定 partGm 时定义）\n")
-
-    # ================================================================
-    # 9) Host：blockNum 改成按单元数算；cScratch 里加上部分和区；填 partOffset
-    # ================================================================
-    # ---- host：把 blockNum / cScratchElems / cScratchBytes 全部**提前**算 ----
-    #
-    # ⚠️ 这里踩过一次编译错误：tiling.partOffset 要用 cScratchElems 和 bmmsBlockNum，
-    #    但原版这两个变量定义在函数后半段（"申请 device 内存"那一节），而
-    #    tiling 结构体在它们**之前**就填好了。直接用会报
-    #        error: use of undeclared identifier 'cScratchElems'
-    #    所以必须把这三个量的计算整体提到 numMBlocks 之后、填 tiling 之前。
-    rep("host 提前算 blockNum/scratch",
+    rep("host 提前算 useMpar/blockNum/scratch",
         "    const int64_t numMBlocks = (M + kBaseM - 1) / kBaseM;",
         "    const int64_t numMBlocks = (M + kBaseM - 1) / kBaseM;\n"
         "\n"
-        "    // ★ M 并行版：并行度不再受 B 限制，而是受「任务单元数」限制。\n"
-        "    //   单元 = 一个 (batch, M块)，总数 = B * numMBlocks。\n"
-        "    //   B=1 且 M=1024 时单元数是 16 ⇒ 能铺 16 个核，而不是原来的 1 个。\n"
+        "    // ★ 是否走 M 并行：只有「任务单元数严格小于核数」时才走，\n"
+        "    //   也就是**每个核恰好分到 1 个单元**。\n"
+        "    //\n"
+        "    //   刻意用严格小于（而不是 <=）留一个核的余量：本地实测中，\n"
+        "    //   单元/核 > 1 的路径有未查清的竞态（80ms + 结果错），\n"
+        "    //   而「核数正好等于物理上限」也在嫌疑名单上（尚未排除）。\n"
+        "    //   少用一个核换确定性，值。\n"
         "    const int64_t bmmsUnits = B * numMBlocks;\n"
+        "    const bool bmmsUseMpar = (bmmsUnits < availableCoreNum);\n"
         "\n"
-        "    // ---- 诊断开关：BMMS_MAX_CORES=<n> 压低 launch 核数上限 ----\n"
-        "    //\n"
-        "    //   用来区分两个都能解释「单元/核 > 1 就出错」的假设：\n"
-        "    //     H1 每核处理多个单元本身有问题\n"
-        "    //     H2 核数正好撞上物理上限（20）时 SyncAll 有问题\n"
-        "    //   让 case18 用 16 个核跑：单元/核 = 64/16 = 4（满足 H1），\n"
-        "    //   但 16 < 20（不满足 H2）。坏了 ⇒ H1；好了 ⇒ H2。\n"
-        "    //\n"
-        "    //   不设这个环境变量时行为完全不变（默认就是 availableCoreNum）。\n"
+        "    // 诊断开关：BMMS_MAX_CORES=<n> 压低核数上限（不设则行为不变）\n"
         "    int64_t bmmsCoreCap = availableCoreNum;\n"
         "    if (const char* bmmsEnv = getenv(\"BMMS_MAX_CORES\")) {\n"
         "        const long long bmmsV = atoll(bmmsEnv);\n"
@@ -319,18 +285,23 @@ def main():
         "        printf(\"[dbg] BMMS_MAX_CORES 生效：核数上限 %lld（原本 %lld）\\n\",\n"
         "               (long long)bmmsCoreCap, (long long)availableCoreNum);\n"
         "    }\n"
-        "    int64_t bmmsBlockNum = (bmmsUnits < bmmsCoreCap) ? bmmsUnits : bmmsCoreCap;\n"
+        "\n"
+        "    int64_t bmmsBlockNum = bmmsUseMpar\n"
+        "                               ? bmmsUnits\n"
+        "                               : ((B < bmmsCoreCap) ? B : bmmsCoreCap);\n"
         "    if (bmmsBlockNum < 1) { bmmsBlockNum = 1; }\n"
         "\n"
-        "    // C 暂存区 = singleCoreM x singleCoreN = kBaseM x N，外加 kSlackElems 余量：\n"
-        "    // 逐行满宽拷贝时最后一行会越读到 tile 末尾之后，这点余量让越读落在自己的内存里。\n"
+        "    printf(\"[mpar] 单元数=%lld 核数=%lld 路径=%s\\n\",\n"
+        "           (long long)bmmsUnits, (long long)bmmsBlockNum,\n"
+        "           bmmsUseMpar ? \"M并行(每核1单元)\" : \"原版(每核1batch)\");\n"
+        "\n"
+        "    // C 暂存区 = kBaseM x N + kSlackElems，每核一份；\n"
+        "    // 后面紧跟部分和区：kPartStride x blockNum（M 并行路径才用，但一起申请省事）\n"
         "    const size_t cScratchElems = static_cast<size_t>(kBaseM) * static_cast<size_t>(N) + kSlackElems;\n"
-        "    // 显存布局：[每核 C 暂存区] x blockNum，紧跟 [部分和区] kPartStride x blockNum\n"
         "    const size_t cScratchBytes = (cScratchElems * static_cast<size_t>(bmmsBlockNum)\n"
         "                                  + static_cast<size_t>(kPartStride) * static_cast<size_t>(bmmsBlockNum))\n"
         "                                 * sizeof(float);")
 
-    # 原版后半段那三行现在重复了，删掉（否则重定义报错）
     rep("host 删掉后半段的重复定义",
         "    // C 暂存区 = singleCoreM x singleCoreN = kBaseM x N，外加 kSlackElems(=kTileN) 余量：\n"
         "    // 逐行满宽拷贝时最后一行会越读到 tile 末尾之后，这点余量让越读落在自己的内存里。\n"
@@ -343,11 +314,12 @@ def main():
         "    if (bmmsBlockNum < 1) { bmmsBlockNum = 1; }\n"
         "    const size_t cScratchBytes = cScratchElems * static_cast<size_t>(bmmsBlockNum) * sizeof(float);",
         "    // （cScratchElems / bmmsBlockNum / cScratchBytes 已在函数开头算好，\n"
-        "    //   因为填 tiling 时就要用 bmmsBlockNum 算 partOffset。）")
+        "    //   因为填 tiling 时就要用它们算 partOffset。）")
 
-    rep("host partOffset",
+    rep("host 填 tiling 的两个新字段",
         "    tiling.dtypeCode = dtypeCode;",
         "    tiling.dtypeCode = dtypeCode;\n"
+        "    tiling.useMpar = bmmsUseMpar ? 1 : 0;\n"
         "    // 部分和区紧跟在「每核 C 暂存区」之后\n"
         "    tiling.partOffset = static_cast<int64_t>(cScratchElems) * bmmsBlockNum;")
 
