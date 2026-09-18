@@ -265,22 +265,46 @@ def main():
     # ================================================================
     # 9) Host：blockNum 改成按单元数算；cScratch 里加上部分和区；填 partOffset
     # ================================================================
-    rep("host blockNum",
+    # ---- host：把 blockNum / cScratchElems / cScratchBytes 全部**提前**算 ----
+    #
+    # ⚠️ 这里踩过一次编译错误：tiling.partOffset 要用 cScratchElems 和 bmmsBlockNum，
+    #    但原版这两个变量定义在函数后半段（"申请 device 内存"那一节），而
+    #    tiling 结构体在它们**之前**就填好了。直接用会报
+    #        error: use of undeclared identifier 'cScratchElems'
+    #    所以必须把这三个量的计算整体提到 numMBlocks 之后、填 tiling 之前。
+    rep("host 提前算 blockNum/scratch",
+        "    const int64_t numMBlocks = (M + kBaseM - 1) / kBaseM;",
+        "    const int64_t numMBlocks = (M + kBaseM - 1) / kBaseM;\n"
+        "\n"
+        "    // ★ M 并行版：并行度不再受 B 限制，而是受「任务单元数」限制。\n"
+        "    //   单元 = 一个 (batch, M块)，总数 = B * numMBlocks。\n"
+        "    //   B=1 且 M=1024 时单元数是 16 ⇒ 能铺 16 个核，而不是原来的 1 个。\n"
+        "    const int64_t bmmsUnits = B * numMBlocks;\n"
+        "    int64_t bmmsBlockNum = (bmmsUnits < availableCoreNum) ? bmmsUnits : availableCoreNum;\n"
+        "    if (bmmsBlockNum < 1) { bmmsBlockNum = 1; }\n"
+        "\n"
+        "    // C 暂存区 = singleCoreM x singleCoreN = kBaseM x N，外加 kSlackElems 余量：\n"
+        "    // 逐行满宽拷贝时最后一行会越读到 tile 末尾之后，这点余量让越读落在自己的内存里。\n"
+        "    const size_t cScratchElems = static_cast<size_t>(kBaseM) * static_cast<size_t>(N) + kSlackElems;\n"
+        "    // 显存布局：[每核 C 暂存区] x blockNum，紧跟 [部分和区] B x blockNum\n"
+        "    const size_t cScratchBytes = (cScratchElems * static_cast<size_t>(bmmsBlockNum)\n"
+        "                                  + static_cast<size_t>(B) * static_cast<size_t>(bmmsBlockNum))\n"
+        "                                 * sizeof(float);")
+
+    # 原版后半段那三行现在重复了，删掉（否则重定义报错）
+    rep("host 删掉后半段的重复定义",
+        "    // C 暂存区 = singleCoreM x singleCoreN = kBaseM x N，外加 kSlackElems(=kTileN) 余量：\n"
+        "    // 逐行满宽拷贝时最后一行会越读到 tile 末尾之后，这点余量让越读落在自己的内存里。\n"
+        "    // 大小完全由 host 自己的 SetShape 决定，\n"
+        "    // 不需要回读 tiling 的私有字段。\n"
+        "    const size_t cScratchElems = static_cast<size_t>(kBaseM) * static_cast<size_t>(N) + kSlackElems;\n"
         "    // ★OPT-1 每核一份 scratch ⇒ 总大小要乘核数。blockNum 必须在 malloc **之前**\n"
         "    //   就算出来（原版是后面才算的）。\n"
         "    int64_t bmmsBlockNum = (B < availableCoreNum) ? B : availableCoreNum;\n"
         "    if (bmmsBlockNum < 1) { bmmsBlockNum = 1; }\n"
         "    const size_t cScratchBytes = cScratchElems * static_cast<size_t>(bmmsBlockNum) * sizeof(float);",
-        "    // ★ M 并行版：并行度不再受 B 限制，而是受「任务单元数」限制。\n"
-        "    //   单元数 = B * numMBlocks（每个单元是一个 64 行的 M 块）。\n"
-        "    //   B=1 且 M=1024 时单元数是 16 ⇒ 可以铺 16 个核，而不是原来的 1 个。\n"
-        "    const int64_t bmmsUnits = B * numMBlocks;\n"
-        "    int64_t bmmsBlockNum = (bmmsUnits < availableCoreNum) ? bmmsUnits : availableCoreNum;\n"
-        "    if (bmmsBlockNum < 1) { bmmsBlockNum = 1; }\n"
-        "    // C 暂存区（每核一份）+ 部分和区（B * blockNum 个 float）\n"
-        "    const size_t cScratchBytes = (cScratchElems * static_cast<size_t>(bmmsBlockNum)\n"
-        "                                  + static_cast<size_t>(B) * static_cast<size_t>(bmmsBlockNum))\n"
-        "                                 * sizeof(float);")
+        "    // （cScratchElems / bmmsBlockNum / cScratchBytes 已在函数开头算好，\n"
+        "    //   因为填 tiling 时就要用 bmmsBlockNum 算 partOffset。）")
 
     rep("host partOffset",
         "    tiling.dtypeCode = dtypeCode;",
