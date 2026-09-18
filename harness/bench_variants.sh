@@ -2,7 +2,7 @@
 # ============================================================================
 # 变体对比测量
 #
-# 用法（在仓库根目录执行，就一行）：
+# 用法（仓库里或运行目录里都能跑，就一行）：
 #     bash harness/bench_variants.sh 1 200
 #
 # 参数：<case_id> [重复次数]
@@ -27,7 +27,29 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
-REPO="$(dirname "${SCRIPT_DIR}")"
+
+# ---- 找 op_kernel 目录 ----
+# 两种跑法都要支持：
+#   ① 在仓库里跑：      bash mysrc/harness/bench_variants.sh   -> ../op_kernel
+#   ② 在运行目录里跑：  bash run/bench_variants.sh            -> 去 mysrc 里找
+# 找不到就用 KERNEL_DIR=/路径/op_kernel 手动指定。
+KERNEL_DIR="${KERNEL_DIR:-}"
+if [ -z "${KERNEL_DIR}" ]; then
+    for cand in "$(dirname "${SCRIPT_DIR}")/op_kernel" \
+                "/mnt/workspace/mysrc/op_kernel" \
+                "${HOME}/mysrc/op_kernel" \
+                "${HOME}/CANN-BatchMatmulMaxSum/op_kernel"; do
+        if [ -d "${cand}" ]; then KERNEL_DIR="${cand}"; break; fi
+    done
+fi
+if [ -z "${KERNEL_DIR}" ] || [ ! -d "${KERNEL_DIR}" ]; then
+    echo "❌ 找不到 op_kernel 目录。"
+    echo "   请手动指定，例如："
+    echo "     KERNEL_DIR=/mnt/workspace/mysrc/op_kernel bash bench_variants.sh ${1:-1}"
+    exit 1
+fi
+echo "kernel 源目录 : ${KERNEL_DIR}"
+echo "运行目录      : ${SCRIPT_DIR}"
 
 CID="${1:-1}"
 REP="${2:-200}"
@@ -48,9 +70,9 @@ VARIANTS=(
 # ---------- 预检 ----------
 for v in "${VARIANTS[@]}"; do
     f="${v%%|*}"
-    if [ ! -f "${REPO}/op_kernel/${f}" ]; then
-        echo "❌ 缺少 ${REPO}/op_kernel/${f}"
-        echo "   先生成： python3 harness/scripts/make_timing_kernel.py"
+    if [ ! -f "${KERNEL_DIR}/${f}" ]; then
+        echo "❌ 缺少 ${KERNEL_DIR}/${f}"
+        echo "   说明 git pull 没拉到最新代码，先在仓库目录执行： git pull"
         exit 1
     fi
 done
@@ -70,7 +92,7 @@ for v in "${VARIANTS[@]}"; do
     echo "#  ${desc}"
     echo "############################################################"
 
-    cp -f "${REPO}/op_kernel/${file}" "${SCRIPT_DIR}/kernel.asc"
+    cp -f "${KERNEL_DIR}/${file}" "${SCRIPT_DIR}/kernel.asc"
     rm -rf "${SCRIPT_DIR}/build"          # kernel 换了，必须重新编译
 
     out="$(bash bench.sh "${CID}" "${REP}" 2>&1)"
