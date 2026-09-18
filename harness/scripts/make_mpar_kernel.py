@@ -102,6 +102,18 @@ def main():
     assert "DataCopyPad(cLocal" in INNER and "WholeReduceMax" in INNER
 
     # ================================================================
+    # 0b) 补两个标准头 —— 本文件用了 printf / getenv / atoll，
+    #     而之前提交的 kernel_cachefix 没用过这些。本文件是被平台的包装
+    #     头文件 #include 进去的，不能假设它一定提供了 <cstdio>/<cstdlib>。
+    #     自己显式包含，零成本消除一个编译失败的风险。
+    # ================================================================
+    rep("include cstdio / cstdlib",
+        "#include <cmath>",
+        "#include <cmath>\n"
+        "#include <cstdio>    // printf —— [mpar] 那行路径诊断输出\n"
+        "#include <cstdlib>   // getenv / atoll —— BMMS_MAX_CORES 诊断开关")
+
+    # ================================================================
     # 1) 常量
     # ================================================================
     rep("常量 kMaxBatch / kPartStride",
