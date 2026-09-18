@@ -48,3 +48,10 @@ Thumbs.db
 # 如果比赛要求保密，把临时笔记和草稿放在这里，不要提交
 notes/private/
 *.local.md
+
+# harness 生成的测试数据
+harness/work/
+harness/build/
+harness/input/
+harness/output/
+harness/case.txt
