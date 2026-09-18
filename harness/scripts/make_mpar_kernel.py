@@ -87,6 +87,17 @@ def main():
         "// 代价只有 512 字节 UB（我们总共才用到 ~66KB，UB 有 192KB）。\n"
         "constexpr int32_t kMaxBatch = 128;\n"
         "\n"
+        "// ★★ 每个核在 GM 部分和区里独占的 float 个数（128 * 4B = 512B）。\n"
+        "//\n"
+        "//   为什么必须独占一整段、而不是按 [b*核数 + 核号] 紧密排列：\n"
+        "//   紧密排列时 B 只有 8 个 float = 32 字节，一条 cache line 里塞着\n"
+        "//   十几个不同核的数据。多核并发写同一条 cache line 会互相冲掉\n"
+        "//   （false sharing），实测症状：\n"
+        "//     - 8 个输出里偶发 1 个变成 0（写丢了）\n"
+        "//     - 核数越多越严重：B=8/16 且铺满 20 个核时耗时从 ~1ms 暴涨到 100ms\n"
+        "//   拉开成每核 512B（≥ 4 条典型 128B cache line）之后就没有共享了。\n"
+        "constexpr int32_t kPartStride = 128;\n"
+        "\n"
         "constexpr int32_t kDtFp16 = 1;")
 
     # ================================================================
@@ -130,13 +141,15 @@ def main():
         "    GlobalTensor<float> yGm;\n"
         "    yGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(y), static_cast<uint32_t>(B));\n"
         "\n"
-        "    // ★ M 并行版：跨核部分和区。布局 [b * blockNum + 核号]，b < B。\n"
+        "    // ★ M 并行版：跨核部分和区。\n"
+        "    //   布局 [核号 * kPartStride + b] —— 每个核独占 kPartStride 个 float，\n"
+        "    //   彼此不共享 cache line（详见 kPartStride 处的说明）。\n"
         "    //   放在 C 暂存区之后（host 侧算好偏移填进 tiling.partOffset）。\n"
         "    const int64_t coreNum = GetBlockNum();\n"
         "    const int64_t coreIdx = GetBlockIdx();\n"
         "    GlobalTensor<float> partGm;\n"
         "    partGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(cScratchGm) + t->partOffset,\n"
-        "                           static_cast<uint32_t>(B * coreNum));")
+        "                           static_cast<uint32_t>(coreNum * kPartStride));")
 
     # ================================================================
     # 5) 循环头：batch 循环 -> 单元循环
@@ -219,10 +232,17 @@ def main():
         "        DataCopyExtParams ycp{1, static_cast<uint32_t>(sizeof(float)), 0, 0, 0};\n"
         "        DataCopyPad(yGm[static_cast<uint32_t>(b)], yLocal, ycp);\n"
         "    }       // end for b\n",
-        "    // ---- 各核把自己的部分和写到 GM ----\n"
-        "    for (int64_t bb = 0; bb < B; ++bb) {\n"
-        "        partGm.SetValue(static_cast<uint32_t>(bb * coreNum + coreIdx),\n"
-        "                        partLocal.GetValue(static_cast<int32_t>(bb)));\n"
+        "    // ---- 各核把自己的部分和写到 GM 上**自己那一段** ----\n"
+        "    //\n"
+        "    //   两个要点：\n"
+        "    //   1) 写到自己独占的 kPartStride 区间，避免多核写同一条 cache line\n"
+        "    //   2) 用 DMA（DataCopyPad）而不是标量 SetValue —— 标量写 GM 不走\n"
+        "    //      向量单元的写通路，正是本算子踩过的那个「写了不落盘」的坑\n"
+        "    {\n"
+        "        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(evtV2E3);\n"
+        "        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(evtV2E3);\n"
+        "        DataCopyExtParams pcp{1, static_cast<uint32_t>(B * sizeof(float)), 0, 0, 0};\n"
+        "        DataCopyPad(partGm[static_cast<uint32_t>(coreIdx * kPartStride)], partLocal, pcp);\n"
         "    }\n"
         "    // 让 GM 上的部分和对所有核可见。\n"
         "    AscendC::DataCacheCleanAndInvalid<float, AscendC::CacheLine::ENTIRE_DATA_CACHE>(partGm);\n"
@@ -241,7 +261,7 @@ def main():
         "    for (int64_t b = coreIdx; b < B; b += coreNum) {\n"
         "        float s = 0.0f;\n"
         "        for (int64_t c = 0; c < coreNum; ++c) {\n"
-        "            s += partGm.GetValue(static_cast<uint32_t>(b * coreNum + c));\n"
+        "            s += partGm.GetValue(static_cast<uint32_t>(c * kPartStride + b));\n"
         "        }\n"
         "        // y 的写出走 DMA（向量单元产出 → DataCopyPad 写回），\n"
         "        // 并在 kernel 结束前由 DataCacheCleanAndInvalid 强制回写 cache。\n"
@@ -286,9 +306,9 @@ def main():
         "    // C 暂存区 = singleCoreM x singleCoreN = kBaseM x N，外加 kSlackElems 余量：\n"
         "    // 逐行满宽拷贝时最后一行会越读到 tile 末尾之后，这点余量让越读落在自己的内存里。\n"
         "    const size_t cScratchElems = static_cast<size_t>(kBaseM) * static_cast<size_t>(N) + kSlackElems;\n"
-        "    // 显存布局：[每核 C 暂存区] x blockNum，紧跟 [部分和区] B x blockNum\n"
+        "    // 显存布局：[每核 C 暂存区] x blockNum，紧跟 [部分和区] kPartStride x blockNum\n"
         "    const size_t cScratchBytes = (cScratchElems * static_cast<size_t>(bmmsBlockNum)\n"
-        "                                  + static_cast<size_t>(B) * static_cast<size_t>(bmmsBlockNum))\n"
+        "                                  + static_cast<size_t>(kPartStride) * static_cast<size_t>(bmmsBlockNum))\n"
         "                                 * sizeof(float);")
 
     # 原版后半段那三行现在重复了，删掉（否则重定义报错）
