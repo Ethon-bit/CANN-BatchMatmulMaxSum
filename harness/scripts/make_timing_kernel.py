@@ -31,7 +31,13 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))       # 仓库根
-SRC = os.path.join(ROOT, "op_kernel", "kernel_cachefix.asc")
+# 默认从 cachefix 派生出三件套（基线 / 无 cache / 空内核）。
+# 设了 BMMS_SRC 就只生成**一个**计时版，源文件换掉、输出名由 BMMS_DST 指定 ——
+# 用来给 kernel_mpar 这类派生版本也加上分阶段计时。
+SRC = os.environ.get("BMMS_SRC",
+                     os.path.join(ROOT, "op_kernel", "kernel_cachefix.asc"))
+ONLY_ONE = "BMMS_SRC" in os.environ
+DST_OVERRIDE = os.environ.get("BMMS_DST", "")
 
 
 def build_variant(text, name, extra=None):
@@ -64,9 +70,14 @@ def build_variant(text, name, extra=None):
         "\n"
         "    const int64_t dbgBlockNum = (B < availableCoreNum) ? B : availableCoreNum;\n"
         "    if (s_bmmsTimingCalls < 8) {\n"
-        "        printf(\"[shape] B=%lld M=%lld N=%lld K=%lld  numMBlocks=%lld  核数=%lld\\n\",\n"
+        "        // ★ 同时打印「单元数」和「launch 核数」。\n"
+        "        //   cachefix 版按 B 分核（核数 = min(B, core)）；\n"
+        "        //   mpar 版按 B*numMBlocks 分核。两个数放一起就能看出并行度有没有上去。\n"
+        "        printf(\"[shape] B=%lld M=%lld N=%lld K=%lld  numMBlocks=%lld  \"\n"
+        "               \"单元数=%lld  launch核数=%lld\\n\",\n"
         "               (long long)B, (long long)M, (long long)N, (long long)K,\n"
-        "               (long long)numMBlocks, (long long)dbgBlockNum);\n"
+        "               (long long)numMBlocks, (long long)(B * numMBlocks),\n"
+        "               (long long)dbgBlockNum);\n"
         "    }")
 
     # ---- 3) t1 ----
@@ -149,10 +160,16 @@ def main():
 
     text = open(SRC, encoding="utf-8").read()
 
-    print("生成计时变体：")
-    build_variant(text, "kernel_timing.asc")
-    build_variant(text, "kernel_timing_nocache.asc", V1_ANCHOR)
-    build_variant(text, "kernel_timing_empty.asc", V2_ANCHOR)
+    if ONLY_ONE:
+        # 单文件模式：给某个派生 kernel（比如 kernel_mpar）加计时，不动三件套
+        name = DST_OVERRIDE or "kernel_timing.asc"
+        print(f"生成单个计时版（源：{os.path.basename(SRC)}）：")
+        build_variant(text, name)
+    else:
+        print("生成计时变体：")
+        build_variant(text, "kernel_timing.asc")
+        build_variant(text, "kernel_timing_nocache.asc", V1_ANCHOR)
+        build_variant(text, "kernel_timing_empty.asc", V2_ANCHOR)
 
     print("\n完成。用 bench_variants.sh 一键对比。")
     return 0
