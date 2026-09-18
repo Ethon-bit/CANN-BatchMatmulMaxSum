@@ -1,19 +1,26 @@
 """
-从 op_kernel/kernel_cachefix.asc 生成 op_kernel/kernel_timing.asc。
+从 op_kernel/kernel_cachefix.asc 生成一组"计时变体" kernel。
 
-差别只有一处：在 host 侧 run_kernel() 里插 5 个计时点，把一次调用的总耗时
-拆成四段打印出来：
+为什么需要变体：
+    本地实测发现一次 run_kernel 要 ~80us，而其中真正算矩阵的时间约等于 0
+    （case01 和 case09 数据量差 21 倍，耗时却一模一样）。也就是说时间全在
+    "准备工作"上。但光知道"全是固定开销"还不够，得知道**具体是哪一段**，
+    才能决定改哪里。
 
-    [phase] tiling=... malloc=... kernel=... free=... || 合计=...
+    单看一个数分不清，所以做**受控对比**：只改一个地方，其余完全不动，
+    两版相减，差值就是那一处的代价。
 
-为什么要拆这四段：
-    平台上看到的「用时」包含整个 run_kernel，而 run_kernel 里有
-      - 生成 tiling（MultiCoreMatmulTiling::GetTiling）
-      - 4 次 aclrtMalloc + 2 次 aclrtMemcpy
-      - 真正跑 kernel
-      - 4 次 aclrtFree
-    aclrtMalloc / aclrtFree 是重操作。如果小形状用例的耗时几乎全在这几段上，
-    那优化方向就完全不是"改算子算法"，而是"别每次重新申请显存"。
+生成三个文件（都在 op_kernel/ 下）：
+
+    kernel_timing.asc          V0 基线：完整 + 5 个计时点
+    kernel_timing_nocache.asc  V1：只删掉 DataCacheCleanAndInvalid 那一行
+    kernel_timing_empty.asc    V2：设备侧立刻 return（空 kernel）
+
+    ★ V0 - V1 = 整 cache 刷新的代价（launch/sync 开销在两者里相同，相减自动抵消）
+    ★ V2      = 我们这套测量方法的固定底噪（launch + sync 的地板）
+
+    ⚠️ V2 的算术结果是错的（它什么都不算）—— 这是**故意的**，
+       它只用来量时间，不要拿它的正确性做任何判断。
 
 用法：
     python3 scripts/make_timing_kernel.py
@@ -25,36 +32,25 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))       # 仓库根
 SRC = os.path.join(ROOT, "op_kernel", "kernel_cachefix.asc")
-DST = os.path.join(ROOT, "op_kernel", "kernel_timing.asc")
 
 
-def main():
-    if not os.path.isfile(SRC):
-        print(f"找不到源文件：{SRC}")
-        print("（它在 fix/gm-cache-writeback 分支上，先 git checkout 过来）")
-        return 1
+def build_variant(text, name, extra=None):
+    """在 cachefix 基础上插入计时点；extra 是 (锚点, 替换内容) 的额外改动。"""
 
-    text = open(SRC, encoding="utf-8").read()
-
-    # 用一个可变容器累积，避免"每次替换都基于原文"的经典 bug
     box = [text]
 
     def rep(tag, old, new):
         n = box[0].count(old)
         if n != 1:
-            print(f"  [失败] {tag}: 匹配到 {n} 处（应为 1 处）")
+            print(f"    [失败] {tag}: 匹配到 {n} 处（应为 1 处）")
             sys.exit(1)
         box[0] = box[0].replace(old, new)
-        print(f"  [ok] {tag}")
 
     # ---- 0) 引入 <chrono> ----
-    rep("include <chrono>",
-        "#include <cmath>",
-        "#include <cmath>\n#include <chrono>")
+    rep("include", "#include <cmath>", "#include <cmath>\n#include <chrono>")
 
     # ---- 1) t0：刚进 run_kernel ----
-    rep("t0 进入函数",
-        "    (void)info_y;",
+    rep("t0", "    (void)info_y;",
         "    (void)info_y;\n"
         "\n"
         "    // ===== 分阶段计时（仅 harness 使用，不影响算子逻辑）=====\n"
@@ -62,9 +58,8 @@ def main():
         "    static int s_bmmsTimingCalls = 0;\n"
         "    const auto tp0 = BmmsClock::now();")
 
-    # ---- 2) 形状回显（放在 tiling 之前，和 [shape] 行对齐）----
-    rep("形状回显",
-        "    const int64_t numMBlocks = (M + kBaseM - 1) / kBaseM;",
+    # ---- 2) 形状回显 ----
+    rep("shape", "    const int64_t numMBlocks = (M + kBaseM - 1) / kBaseM;",
         "    const int64_t numMBlocks = (M + kBaseM - 1) / kBaseM;\n"
         "\n"
         "    const int64_t dbgBlockNum = (B < availableCoreNum) ? B : availableCoreNum;\n"
@@ -74,15 +69,14 @@ def main():
         "               (long long)numMBlocks, (long long)dbgBlockNum);\n"
         "    }")
 
-    # ---- 3) t1：tiling 生成结束 ----
-    rep("t1 tiling 结束",
-        "    // 不再 SetFixSplit / SetSplitRange：kernel 侧不依赖 baseN，",
+    # ---- 3) t1 ----
+    rep("t1", "    // 不再 SetFixSplit / SetSplitRange：kernel 侧不依赖 baseN，",
         "    const auto tp1 = BmmsClock::now();   // ← tiling 生成结束\n"
         "\n"
         "    // 不再 SetFixSplit / SetSplitRange：kernel 侧不依赖 baseN，")
 
-    # ---- 4) t2：显存申请 + tiling 搬运结束 ----
-    rep("t2 malloc 结束",
+    # ---- 4) t2 ----
+    rep("t2",
         "    aclrtMemcpy(myTilingDev, sizeof(BmmsTiling), hostMyTiling.data(), sizeof(BmmsTiling),\n"
         "                ACL_MEMCPY_HOST_TO_DEVICE);",
         "    aclrtMemcpy(myTilingDev, sizeof(BmmsTiling), hostMyTiling.data(), sizeof(BmmsTiling),\n"
@@ -90,17 +84,14 @@ def main():
         "\n"
         "    const auto tp2 = BmmsClock::now();   // ← 显存申请 + 搬运结束")
 
-    # ---- 5) t3：kernel 执行结束 ----
-    rep("t3 kernel 结束",
-        "    // ---- 6. 同步后释放 ----\n"
-        "    aclrtSynchronizeStream(stream);",
+    # ---- 5) t3 ----
+    rep("t3", "    // ---- 6. 同步后释放 ----\n    aclrtSynchronizeStream(stream);",
         "    // ---- 6. 同步后释放 ----\n"
         "    aclrtSynchronizeStream(stream);\n"
         "    const auto tp3 = BmmsClock::now();   // ← kernel 执行结束")
 
-    # ---- 6) t4：释放结束 + 打印 ----
-    rep("t4 打印",
-        "    aclrtFree(cScratchDev);\n}",
+    # ---- 6) t4 + 打印 ----
+    rep("t4", "    aclrtFree(cScratchDev);\n}",
         "    aclrtFree(cScratchDev);\n"
         "\n"
         "    const auto tp4 = BmmsClock::now();\n"
@@ -120,8 +111,50 @@ def main():
         "    ++s_bmmsTimingCalls;\n"
         "}")
 
-    open(DST, "w", encoding="utf-8", newline="\n").write(box[0])
-    print(f"\n已写出 {DST}（{box[0].count(chr(10)) + 1} 行）")
+    # ---- 7) 变体专属改动 ----
+    if extra:
+        rep(extra[0], extra[1], extra[2])
+
+    out = os.path.join(ROOT, "op_kernel", name)
+    open(out, "w", encoding="utf-8", newline="\n").write(box[0])
+    print(f"    -> {name}")
+
+
+# ---------------------------------------------------------------------------
+
+V1_ANCHOR = ("删掉 cache 回写",
+    "    AscendC::DataCacheCleanAndInvalid<float, AscendC::CacheLine::ENTIRE_DATA_CACHE>(yGm);",
+    "    // ★★ V1 变体：这一行被**故意删掉**了。\n"
+    "    //   原版靠它把 aicore cache 里的脏数据刷回 GM，是拿到 15/15 的关键。\n"
+    "    //   这里删掉只为测量它的耗时，**算术结果是错的，不要用它提交**。\n"
+    "    // AscendC::DataCacheCleanAndInvalid<float, AscendC::CacheLine::ENTIRE_DATA_CACHE>(yGm);")
+
+V2_ANCHOR = ("设备侧提前返回",
+    "    const int32_t isTransB = t->isTransB;",
+    "    const int32_t isTransB = t->isTransB;\n"
+    "\n"
+    "    // ★★ V2 变体：立刻返回，什么都不算。\n"
+    "    //   目的：量出 launch + sync 的**地板开销**，作为解读 V0/V1 的参照。\n"
+    "    //   条件恒成立（B/M/N/K 等都是非负数），只是为了不让变量变成未使用。\n"
+    "    //   ⚠️ 它不写 y，算术结果必然是错的 —— 这是故意的。\n"
+    "    if (B + M + N + K + numMBlocks + isTransA + isTransB >= 0) {\n"
+    "        return;\n"
+    "    }")
+
+
+def main():
+    if not os.path.isfile(SRC):
+        print(f"找不到源文件：{SRC}")
+        return 1
+
+    text = open(SRC, encoding="utf-8").read()
+
+    print("生成计时变体：")
+    build_variant(text, "kernel_timing.asc")
+    build_variant(text, "kernel_timing_nocache.asc", V1_ANCHOR)
+    build_variant(text, "kernel_timing_empty.asc", V2_ANCHOR)
+
+    print("\n完成。用 bench_variants.sh 一键对比。")
     return 0
 
 
